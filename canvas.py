@@ -1,10 +1,15 @@
+from __future__ import annotations
+
 from typing import Optional, List
 from PyQt6.QtWidgets import (
     QGraphicsView, QGraphicsScene, QGraphicsEllipseItem, QGraphicsLineItem,
-    QGraphicsItemGroup, QGraphicsRectItem, QMessageBox
+    QGraphicsItemGroup, QGraphicsRectItem, QMessageBox,
+    QMenu,
 )
-from PyQt6.QtGui import QPixmap, QPainter, QPen, QBrush, QCursor
+from PyQt6.QtGui import QPixmap, QPainter, QPen, QBrush, QCursor, QAction
 from PyQt6.QtCore import Qt, QRectF, QPointF
+from PyQt6.sip import isdeleted
+
 from point_data import PointData
 import config
 import gui_tool
@@ -40,6 +45,8 @@ class ImageCanvas(QGraphicsView):
     # ── 給外部呼叫：切換 highlight ──────────────────────────────
     def highlight(self, idx: Optional[int]):
         """把指定 idx 畫黃框，其餘恢復原色；idx=None 代表全部取消。"""
+        if idx is not None and (idx >= len(self.point_items) or not self.point_items[idx] or isdeleted(
+            self.point_items[idx])): idx = None
         # 1) 先還原舊的
         if self._selected_idx is not None:
             self._set_group_pen(self._selected_idx, config.PEN)  # 原本紅色
@@ -51,9 +58,15 @@ class ImageCanvas(QGraphicsView):
     # ── 私用：把 group 底下所有 child item 改成指定 pen ────────────
     def _set_group_pen(self, idx: int, pen: QPen):
         grp = self.point_items[idx]
-        if not grp:
+
+        # A. group 本身就已經被 C++ delete？直接跳過
+        if not grp or isdeleted(grp):
             return
+
+        # B. 逐一檢查底下 child，活著的才 setPen
         for child in grp.childItems():
+            if isdeleted(child):
+                continue
             if isinstance(child, (QGraphicsEllipseItem, QGraphicsLineItem)):
                 child.setPen(pen)
     # ── 私用：重建十字線 ────────────────────────────────────────────
@@ -107,26 +120,29 @@ class ImageCanvas(QGraphicsView):
 
     # ── 中鍵平移 & 左/右鍵標點 ───────────────────────────────────────
     def mousePressEvent(self, e):
+        # ───────── BBox 模式 ─────────
         if self._mw.mode == "bbox":
             if e.button() == Qt.MouseButton.LeftButton:
                 pos = self.mapToScene(e.position().toPoint())
                 if self._bbox_start is None:
-                    # 第一下：記住起點 & 建立 temp rect
+                    # 第一下：記住起點 & 建 temp rect
                     self._bbox_start = pos
-                    self._bbox_temp = self.scene().addRect(QRectF(pos, pos), QPen(Qt.GlobalColor.green, 0))
+                    self._bbox_temp = self.scene().addRect(
+                        QRectF(pos, pos), QPen(Qt.GlobalColor.green, 0))
                     self._bbox_temp.setZValue(1)
                 else:
                     # 第二下：固定 bbox
                     rect = QRectF(self._bbox_start, pos).normalized()
                     if rect.width() > 3 and rect.height() > 3:  # 過小就丟掉
                         self._bbox_temp.setRect(rect)
-                        self._mw.bboxes.append(self._bbox_temp)  # 收進清單
+                        self._mw.bboxes.append(self._bbox_temp)
                         self._mw.update_bbox_table()
                     else:
                         self.scene().removeItem(self._bbox_temp)
                     self._bbox_start = None
                     self._bbox_temp = None
                 return
+
             elif e.button() == Qt.MouseButton.RightButton:
                 # 檢查有沒有點到 bbox → 刪除
                 pos = self.mapToScene(e.position().toPoint())
@@ -138,47 +154,62 @@ class ImageCanvas(QGraphicsView):
                         break
                 return
 
+        # ───────── 中鍵：彈選單 → 標點 ─────────
+        if e.button() == Qt.MouseButton.MiddleButton:
+            scene_pos = self.mapToScene(e.position().toPoint())
+            idx = self._popup_id_menu(e.globalPosition().toPoint())
+            if idx is not None:
+                self._mark_point(idx, scene_pos)
+            return  # 吃掉事件
+
+        # ───────── 左鍵點擊：先確定是不是點到既有點 ─────────
         if e.button() == Qt.MouseButton.LeftButton:
             scene_pos = self.mapToScene(e.position().toPoint())
 
-            # 以 MARK_RADIUS 當容忍，撈出那個小方塊裡所有 item
+            # 1) 命中測試：小方塊內找 group
             hit_rect = QRectF(scene_pos.x() - config.MARK_RADIUS,
                               scene_pos.y() - config.MARK_RADIUS,
                               config.MARK_RADIUS * 2, config.MARK_RADIUS * 2)
             for it in self.scene().items(hit_rect):
-                # 往上找 QGraphicsItemGroup
                 grp = it
                 while grp and not isinstance(grp, QGraphicsItemGroup):
                     grp = grp.parentItem()
                 if grp and grp.data(0) is not None:
                     idx = int(grp.data(0))
-                    self._mw.select_row(idx)  # 反向選表格 + 設 active_idx
+                    self._mw.select_row(idx)
                     self.highlight(idx)
                     return
 
-        if e.button() == Qt.MouseButton.MiddleButton:
-            self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
-            self._panning = True
-            super().mousePressEvent(e)
+            # 2) 沒打到現有點 → 用 active_idx 畫新點
+            idx = self._mw.active_idx
+            if idx is None:
+                QMessageBox.information(self, "先選 Keypoint", "請在右側表格選擇要標記的列。")
+                return
+            self._mark_point(idx, scene_pos)
             return
 
-        idx = self._mw.active_idx
-        if idx is None:
-            QMessageBox.information(self, "先選 Keypoint",
-                                    "請在右側表格選擇要標記的列。")
-            return
+        # ───────── 右鍵：清除當前 active_idx ─────────
+        if e.button() == Qt.MouseButton.RightButton:
+            idx = self._mw.active_idx
+            if idx is not None:
+                pd = self._mw.points[idx]
 
-        pos = self.mapToScene(e.position().toPoint())
-        if e.button() == Qt.MouseButton.LeftButton:
-            pd = PointData(pos.x(), pos.y())
-            self._mw.set_point(idx, pd)
-            self._draw(idx, pd)
-            self._mw.select_next_row()
-            self.update_edges_for(idx)
-        elif e.button() == Qt.MouseButton.RightButton:
-            self._mw.clear_point(idx)
-            self._remove(idx)
-            self.update_edges_for(idx)
+                # 如果目前沒有資料，或之前就已經刪掉了，就不必做事
+                if pd is None or pd.is_null:
+                    return
+
+                if pd.visible:
+                    # 【第一下】把 visible 改成 False，畫成叉叉
+                    pd.visible = False
+                    self._mw.set_point(idx, pd)  # 更新資料模型
+                    self._draw(idx, pd)  # 重新繪製這個點
+                else:
+                    # 【第二下】已經是 invisible，再右鍵就真正刪除
+                    self._mw.clear_point(idx)  # 把資料設為 is_null
+                    self._remove(idx)  # 從畫面移除
+                # 無論第一下或第二下，都要刷新相關邊
+                self.update_edges_for(idx)
+            return
 
         super().mousePressEvent(e)
 
@@ -190,14 +221,18 @@ class ImageCanvas(QGraphicsView):
 
     # ── 載入影像 ─────────────────────────────────────────────────────
     def load_image(self, path: str):
+        # ---------- A. 先斷開所有 Python 端引用 ----------
+        print(path)
+        self.highlight(None)
+        self.edge_items.clear()  # ① 把線的 dict 先清掉
+        self.point_items = [None] * config.MAX_POINTS  # ② 點的 group 清單也丟掉
+
         # 清場但保留十字線：先把 guide 的指標留著，清完再重建
         self.scene().clear()
-        self.point_items = [None] * config.MAX_POINTS
-        self.edge_items.clear()
         self._create_guides()
         self._mw.bboxes.clear()
-        self.resetTransform()
-        self._zoom = 0
+        # self.resetTransform()
+        # self._zoom = 0
 
         pm = QPixmap(path)
         pix = self.scene().addPixmap(pm)
@@ -244,6 +279,28 @@ class ImageCanvas(QGraphicsView):
             self.point_items[idx] = None
             if idx == self._selected_idx:
                 self._selected_idx = None
+
+    # ── 私用：彈出 0‥31 ID 選單，回傳被選 ID 或 None ─────────────
+    def _popup_id_menu(self, global_pos):
+        menu = QMenu(self)
+        for idx in range(config.MAX_POINTS):
+            act = menu.addAction(f"ID {idx + 1}")
+            act.setData(idx)  # 用 QAction.data() 存 idx
+            if idx == self._mw.active_idx:  # 目前那個打勾
+                act.setCheckable(True)
+                act.setChecked(True)
+        chosen: QAction | None = menu.exec(global_pos)
+        return chosen.data() if chosen else None
+
+        # ── 私用：共用的「以 idx 在 scene_pos 標點」邏輯 ────────────
+    def _mark_point(self, idx: int, scene_pos: QPointF):
+        pd = PointData(scene_pos.x(), scene_pos.y())
+        self._mw.set_point(idx, pd)  # 寫回資料
+        self._draw(idx, pd)  # 畫點
+        self.update_edges_for(idx)  # 更新線
+        self._mw.select_row(idx)  # 表格同步
+        self.highlight(idx)  # 黃框同步
+        self._mw.select_next_row()  # 順手跳下一列
 
     # ── 更新邊 ───────────────────────────────────────────────────────
     def update_edges_for(self, point_idx: int):

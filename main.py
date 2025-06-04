@@ -19,6 +19,8 @@
 
 from __future__ import annotations
 
+import faulthandler
+import signal
 import sys
 from PyQt6.QtWidgets import (
     QApplication

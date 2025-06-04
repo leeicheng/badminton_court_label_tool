@@ -1,3 +1,4 @@
+from __future__ import annotations
 import json, sys, glob
 from pathlib import Path
 from dataclasses import dataclass, asdict
@@ -10,7 +11,7 @@ from PyQt6.QtWidgets import (
     QGraphicsScene, QGraphicsView, QGraphicsEllipseItem, QGraphicsLineItem,
     QGraphicsItemGroup, QPushButton, QListWidget, QGraphicsRectItem, QSizePolicy
 )
-from PyQt6.QtGui import QPixmap, QPainter, QPen, QBrush, QColor, QCursor
+from PyQt6.QtGui import QPixmap, QPainter, QPen, QBrush, QColor, QCursor, QShortcut, QKeySequence
 from PyQt6.QtCore import Qt, QRectF, QPointF
 from networkx.classes import add_path
 
@@ -26,6 +27,7 @@ from PyQt6.QtWidgets import (
 )
 
 class MainWindow(QMainWindow):
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("32-Point Court Marker")
@@ -38,7 +40,7 @@ class MainWindow(QMainWindow):
         self.active_idx: Optional[int] = None
         self.img_paths: List[str] = []
         self.cur_idx: int = -1
-
+        self.template_labels: dict | None = None
         # ------------ 左側畫布 ------------
         self.canvas = ImageCanvas(self)
 
@@ -73,6 +75,16 @@ class MainWindow(QMainWindow):
 
         # — 塞進 key_layout —
         key_layout.addWidget(self.table_pts)
+        self.map = QLabel(self)
+
+        # 原圖載入
+        pixmap = QPixmap("./map.png")
+        w, h = pixmap.width(), pixmap.height()
+        scaled_pixmap = pixmap.scaled(w // 2, h // 2)
+
+        # 縮圖處理
+        self.map.setPixmap(scaled_pixmap)
+        key_layout.addWidget(self.map)
         key_layout.addStretch()
 
         self.lbl_bbox_cnt = QLabel("已標記 BBox：0")
@@ -88,6 +100,8 @@ class MainWindow(QMainWindow):
         switcher.add_page("Keypoints", key_widget)    # ▼ 修正：傳 widget，不是 layout
         switcher.add_page("bbox", bbox_widget)
 
+        btn_template = QPushButton("套用到後續")  # ★ 新增
+        btn_template.clicked.connect(self._set_template_from_current)
 
         # ------------ 整體右側佈局 ------------
         right_wrap = QWidget()
@@ -95,6 +109,7 @@ class MainWindow(QMainWindow):
         right_layout.addLayout(h_btns)
         right_layout.addWidget(self.label_imgs)
         right_layout.addWidget(self.list_img)
+        right_layout.addWidget(btn_template)
         right_layout.addWidget(switcher, 1)           # stretch=1 → 吃滿剩餘空間
 
         # ------------ 主視窗根佈局 ------------
@@ -104,6 +119,9 @@ class MainWindow(QMainWindow):
 
         cw = QWidget(); cw.setLayout(root)
         self.setCentralWidget(cw)
+
+        QShortcut(QKeySequence(Qt.Key.Key_Up), self).activated.connect(self.prev_img)
+        QShortcut(QKeySequence(Qt.Key.Key_Down), self).activated.connect(self.next_img)
 
 
     # ----- table -----
@@ -260,41 +278,63 @@ class MainWindow(QMainWindow):
         return Path(self.img_paths[idx] + POINT_FILE_SUFFIX)
 
     def _load_points(self, idx: int):
-        # ---------- 1. 讀檔 ----------
-        pts_raw   = [None] * MAX_POINTS
-        bbox_geos = []                      # 暫存幾何資料，等畫面清完再 addRect()
-
+        # ---------- 0. 如果有範本且檔案不存在，先準備相對→絕對 ----------
         fp = self._pts_path(idx)
-        if fp.exists():
-            try:
-                raw = json.load(open(fp, "r", encoding="utf-8"))
-                # 舊格式只有 list → 包成 dict
-                if isinstance(raw, list):
-                    raw = {"points": raw, "bboxes": []}
+        if not fp.exists() and self.template_labels:
+            pix = QPixmap(self.img_paths[idx])
+            iw, ih = pix.width(), pix.height()
 
-                # points
-                for ridx, data in enumerate(raw.get("points", [])):
-                    if 0 <= ridx < MAX_POINTS and not data.get("is_null", False):
-                        pts_raw[ridx] = PointData(**data)
+            # 套用 points
+            pts_raw = []
+            for tp in self.template_labels["points"]:
+                if tp is None:
+                    pts_raw.append(None)
+                else:
+                    pts_raw.append(PointData(
+                        x=tp["x"] * iw,
+                        y=tp["y"] * ih,
+                        visible=tp.get("visible", True)
+                    ))
 
-                # bboxes：先存成 QRectF
-                for b in raw.get("bboxes", []):
-                    bbox_geos.append(QRectF(b["x"], b["y"], b["w"], b["h"]))
+            # 套用 bboxes
+            bbox_geos = []
+            for tb in self.template_labels["bboxes"]:
+                bbox_geos.append(QRectF(
+                    tb["x"] * iw,
+                    tb["y"] * ih,
+                    tb["w"] * iw,
+                    tb["h"] * ih
+                ))
+        else:
+            # ---------- 1. 讀檔 (原本的整段搬進 else 分支) ----------
+            pts_raw = [None] * MAX_POINTS
+            bbox_geos = []
+            if fp.exists():
+                try:
+                    raw = json.load(open(fp, "r", encoding="utf-8"))
+                    if isinstance(raw, list):
+                        raw = {"points": raw, "bboxes": []}
 
-            except Exception as e:
-                print("讀取標註失敗：", e)
+                    for ridx, data in enumerate(raw.get("points", [])):
+                        if 0 <= ridx < MAX_POINTS:
+                            pts_raw[ridx] = PointData(**data)
 
-        # ---------- 2. 更新 state ----------
+                    for b in raw.get("bboxes", []):
+                        bbox_geos.append(QRectF(b["x"], b["y"], b["w"], b["h"]))
+                except Exception as e:
+                    print("讀取標註失敗：", e)
+
+        # ---------- 2. 更新 state（以下跟你原本第 2、3、4 步一樣） ----------
         self.points = pts_raw
         self.bboxes.clear()
         self.update_bbox_table()
         for r in range(MAX_POINTS):
             self._sync_row(r, self.points[r])
 
-        # ---------- 3. 重新載圖（這一步會清 scene & 重畫 keypoints） ----------
+        # 重新載圖（此步會清 scene & 重畫 keypoints）
         self.canvas.load_image(self.img_paths[idx])
 
-        # ---------- 4. 把 bbox 加回去 ----------
+        # 把 bbox 加回去
         for rectf in bbox_geos:
             item = self.canvas.scene().addRect(rectf, QPen(Qt.GlobalColor.green, 0))
             item.setZValue(1)
@@ -317,6 +357,86 @@ class MainWindow(QMainWindow):
         with open(self._pts_path(idx), "w", encoding="utf-8") as f:
             json.dump({"points": pts_out, "bboxes": bboxes_out},
                       f, indent=2, ensure_ascii=False)
+
+    def _set_template_from_current(self):
+        """把目前圖片的標註存成範本，並立即套用到資料夾內所有缺少 .points.json 的圖片。"""
+        if self.cur_idx < 0 or not self.img_paths:
+            QMessageBox.warning(self, "還沒有圖片", "請先載入並標註第一張圖片")
+            return
+
+        # ── 1. 建立「相對座標」範本 ──────────────────────────
+        pix = QPixmap(self.img_paths[self.cur_idx])
+        iw, ih = pix.width(), pix.height()
+        if iw == 0 or ih == 0:
+            QMessageBox.warning(self, "無法讀取圖片", "圖片尺寸為 0?")
+            return
+
+        tmpl_pts = [
+            None if p is None else {
+                "x": p.x / iw,
+                "y": p.y / ih,
+                "visible": p.visible,
+                "is_null": p.is_null  # 之後若要支援 is_null 再改
+            }
+            for p in self.points
+        ]
+
+        tmpl_boxes = []
+        for r in self.bboxes:
+            rect = r.rect()
+            tmpl_boxes.append({
+                "x": rect.x() / iw,
+                "y": rect.y() / ih,
+                "w": rect.width() / iw,
+                "h": rect.height() / ih
+            })
+
+        self.template_labels = {"points": tmpl_pts, "bboxes": tmpl_boxes}
+
+        # ── 2. 立即寫入所有缺檔的圖片 ────────────────────────
+        created = 0
+        for img_path in self.img_paths:
+            pts_path = Path(img_path + POINT_FILE_SUFFIX)
+            if pts_path.exists():  # 已經有標註檔就跳過
+                continue
+
+            # 依該張圖大小，把「相對範本」轉回「絕對 pixel 座標」
+            pix = QPixmap(img_path)
+            iw, ih = pix.width(), pix.height()
+            if iw == 0 or ih == 0:
+                continue
+
+            pts_out = [
+                None if p is None else {
+                    "x": p["x"] * iw,
+                    "y": p["y"] * ih,
+                    "visible": p.get("visible", True),
+                    "is_null": p.get("is_null", False)
+                }
+                for p in tmpl_pts
+            ]
+            boxes_out = [
+                {
+                    "x": b["x"] * iw,
+                    "y": b["y"] * ih,
+                    "w": b["w"] * iw,
+                    "h": b["h"] * ih
+                }
+                for b in tmpl_boxes
+            ]
+
+            with open(pts_path, "w", encoding="utf-8") as f:
+                json.dump({"points": pts_out, "bboxes": boxes_out},
+                          f, indent=2, ensure_ascii=False)
+            created += 1
+
+        # ── 3. 完成訊息 ───────────────────────────────────
+        QMessageBox.information(
+            self,
+            "範本已套用",
+            f"完成！已為 {created} 張圖片建立 .points.json。"
+            if created else "所有圖片都已經有 .points.json，不需再建立。"
+        )
 
     # ----- close -----
     def closeEvent(self, e):
